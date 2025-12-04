@@ -24,6 +24,8 @@ import (
 type CompileRequest struct {
 	Sources   map[string]string `json:"sources"`
 	TopModule string            `json:"topModule"`
+	Freq      *int              `json:"freq,omitempty"`
+	Seed      *int              `json:"seed,omitempty"`
 }
 
 type StreamMessage struct {
@@ -246,10 +248,19 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Run nextpnr-ice40
+	freq := 12
+	if req.Freq != nil {
+		freq = *req.Freq
+	}
+	seed := 42
+	if req.Seed != nil {
+		seed = *req.Seed
+	}
+
 	nextpnrArgs := []string{
 		"--pcf-allow-unconstrained",
-		"--seed", "10",
-		"--freq", "48",
+		"--seed", fmt.Sprintf("%d", seed),
+		"--freq", fmt.Sprintf("%d", freq),
 		"--package", "sg48",
 		"--up5k",
 		"--asc", "output.asc",
