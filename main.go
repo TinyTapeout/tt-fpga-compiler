@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+const (
+	// CompilationTimeout is the maximum time allowed for a compilation request
+	CompilationTimeout = 120 * time.Second
 )
 
 type CompileRequest struct {
@@ -163,6 +169,10 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(r.Context(), CompilationTimeout)
+	defer cancel()
+
 	// Start metrics tracking
 	startTime := time.Now()
 	compilationInProgress.Inc()
@@ -243,7 +253,7 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	}
 	yosysArgs = append(yosysArgs, sourceFiles...)
 
-	if !runCommand(w, flusher, workDir, "yosys", yosysArgs) {
+	if !runCommand(ctx, w, flusher, workDir, "yosys", yosysArgs) {
 		return
 	}
 
@@ -268,13 +278,13 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		"--json", "output.json",
 	}
 
-	if !runCommand(w, flusher, workDir, "nextpnr-ice40", nextpnrArgs) {
+	if !runCommand(ctx, w, flusher, workDir, "nextpnr-ice40", nextpnrArgs) {
 		return
 	}
 
 	// Run icepack
 	icepackArgs := []string{"output.asc", "output.bin"}
-	if !runCommand(w, flusher, workDir, "icepack", icepackArgs) {
+	if !runCommand(ctx, w, flusher, workDir, "icepack", icepackArgs) {
 		return
 	}
 
@@ -294,7 +304,7 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func runCommand(w http.ResponseWriter, flusher http.Flusher, workDir, command string, args []string) bool {
+func runCommand(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, workDir, command string, args []string) bool {
 	startTime := time.Now()
 	defer func() {
 		commandExecutionDuration.WithLabelValues(command).Observe(time.Since(startTime).Seconds())
@@ -306,7 +316,7 @@ func runCommand(w http.ResponseWriter, flusher http.Flusher, workDir, command st
 		Args:    args,
 	})
 
-	cmd := exec.Command(command, args...)
+	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = workDir
 
 	stdout, err := cmd.StdoutPipe()
@@ -333,7 +343,12 @@ func runCommand(w http.ResponseWriter, flusher http.Flusher, workDir, command st
 	go streamOutput(w, flusher, stderr, "stderr")
 
 	if err := cmd.Wait(); err != nil {
-		sendSSE(w, flusher, StreamMessage{Type: "error", Message: fmt.Sprintf("%s failed: %v", command, err)})
+		// Check if the error is due to context timeout
+		if ctx.Err() == context.DeadlineExceeded {
+			sendSSE(w, flusher, StreamMessage{Type: "error", Message: fmt.Sprintf("Compilation timeout: operation exceeded %v", CompilationTimeout)})
+		} else {
+			sendSSE(w, flusher, StreamMessage{Type: "error", Message: fmt.Sprintf("%s failed: %v", command, err)})
+		}
 		return false
 	}
 
