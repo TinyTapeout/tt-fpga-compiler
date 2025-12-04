@@ -1,0 +1,36 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build Docker container
+      run: make docker-build
+
+    - name: Start container in background
+      run: docker run -d -p 8080:8080 --name fpga-compiler fpga-compiler:latest
+
+    - name: Wait for service to be ready
+      run: |
+        timeout 30 bash -c 'until curl -f http://localhost:8080/health; do sleep 1; done'
+
+    - name: Run API test
+      run: make test-api
+
+    - name: Show container logs
+      if: always()
+      run: docker logs fpga-compiler
+
+    - name: Stop container
+      if: always()
+      run: docker stop fpga-compiler && docker rm fpga-compiler
