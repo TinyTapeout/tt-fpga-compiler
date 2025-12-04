@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type CompileRequest struct {
@@ -32,9 +34,51 @@ type StreamMessage struct {
 	Message string   `json:"message,omitempty"`
 }
 
+var (
+	compilationRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fpga_compilation_requests_total",
+			Help: "Total number of FPGA compilation requests",
+		},
+		[]string{"status"}, // "success" or "error"
+	)
+
+	compilationDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "fpga_compilation_duration_seconds",
+			Help:    "Duration of FPGA compilation requests in seconds",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 10), // 1s, 2s, 4s, 8s, ... up to ~512s
+		},
+	)
+
+	compilationInProgress = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "fpga_compilation_in_progress",
+			Help: "Number of FPGA compilations currently in progress",
+		},
+	)
+
+	commandExecutionDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "fpga_command_execution_duration_seconds",
+			Help:    "Duration of individual FPGA toolchain command execution in seconds",
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 10), // 0.1s, 0.2s, 0.4s, ... up to ~51s
+		},
+		[]string{"command"}, // "yosys", "nextpnr-ice40", "icepack"
+	)
+)
+
+func init() {
+	prometheus.MustRegister(compilationRequestsTotal)
+	prometheus.MustRegister(compilationDuration)
+	prometheus.MustRegister(compilationInProgress)
+	prometheus.MustRegister(commandExecutionDuration)
+}
+
 func main() {
 	http.HandleFunc("/api/compile", loggingMiddleware(corsMiddleware(handleCompile)))
 	http.HandleFunc("/health", loggingMiddleware(handleHealth))
+	http.Handle("/metrics", promhttp.Handler())
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -116,6 +160,16 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
+
+	// Start metrics tracking
+	startTime := time.Now()
+	compilationInProgress.Inc()
+	status := "error" // Default to error, set to success on completion
+	defer func() {
+		compilationInProgress.Dec()
+		compilationDuration.Observe(time.Since(startTime).Seconds())
+		compilationRequestsTotal.WithLabelValues(status).Inc()
+	}()
 
 	// Set up SSE
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -222,6 +276,7 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send success message with bitstream as base64
+	status = "success"
 	sendSSE(w, flusher, StreamMessage{
 		Type: "success",
 		Data: fmt.Sprintf("base64:%s", base64.StdEncoding.EncodeToString(bitstream)),
@@ -229,6 +284,11 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 }
 
 func runCommand(w http.ResponseWriter, flusher http.Flusher, workDir, command string, args []string) bool {
+	startTime := time.Now()
+	defer func() {
+		commandExecutionDuration.WithLabelValues(command).Observe(time.Since(startTime).Seconds())
+	}()
+
 	sendSSE(w, flusher, StreamMessage{
 		Type:    "command",
 		Command: command,
